@@ -53,12 +53,15 @@ def admin_keyboard():
     kb = VkKeyboard(one_time=False)
     kb.add_button("/chats", color=VkKeyboardColor.PRIMARY)
     kb.add_button("/close", color=VkKeyboardColor.NEGATIVE)
+    kb.add_line()
+    kb.add_button("/help", color=VkKeyboardColor.SECONDARY)
     return kb.get_keyboard()
 
 
 def admin_empty_keyboard():
     kb = VkKeyboard(one_time=False)
     kb.add_button("/chats", color=VkKeyboardColor.PRIMARY)
+    kb.add_button("/help", color=VkKeyboardColor.SECONDARY)
     return kb.get_keyboard()
 
 
@@ -81,6 +84,27 @@ def handle_admin(vk, text):
     """Обработка сообщений от админа. Возвращает True если обработано."""
     global admin_chat_with
     lower = text.strip().lower()
+
+    # /help — подсказка для админа
+    if lower == "/help":
+        send(vk, ADMIN_ID,
+             "📖 Команды оператора:\n\n"
+             "👥 Управление чатами:\n"
+             "/chats — список активных чатов\n"
+             "/chat ID — подключиться к пользователю\n"
+             "/close — завершить текущий чат\n"
+             "/close ID — завершить конкретный чат\n\n"
+             "💬 Ответы пользователям:\n"
+             "1. /chat ID → потом просто пишете текст\n"
+             "2. #ID текст — быстрый ответ без подключения\n\n"
+             "📌 Как это работает:\n"
+             "• Пользователь нажимает «Оператор» → вам приходит 🟢\n"
+             "• Вы пишете /chat ID → подключаетесь к диалогу\n"
+             "• Пишете сообщения — они уходят пользователю\n"
+             "• Когда решили вопрос — /close\n"
+             "• Пользователь получит уведомление о закрытии",
+             admin_empty_keyboard())
+        return True
 
     # /chats — список активных чатов
     if lower == "/chats":
