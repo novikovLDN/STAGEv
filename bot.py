@@ -1,5 +1,4 @@
 import os
-import json
 import logging
 from dotenv import load_dotenv
 import vk_api
@@ -19,9 +18,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("atlas-support")
 
-# Пользователи, которые сейчас общаются с оператором
-# {user_id: True}
-operator_sessions = {}
+# {user_id: True} — пользователи в режиме оператора
+user_sessions = {}
+
+# ID пользователя, с которым админ сейчас ведёт диалог (или None)
+admin_chat_with = None
 
 
 # ── Клавиатуры ────────────────────────────────────────────────
@@ -42,9 +43,22 @@ def faq_keyboard():
     return kb.get_keyboard()
 
 
-def back_keyboard():
+def user_operator_keyboard():
     kb = VkKeyboard(one_time=False)
-    kb.add_button("⬅ Назад в меню", color=VkKeyboardColor.SECONDARY)
+    kb.add_button("❌ Завершить чат", color=VkKeyboardColor.NEGATIVE)
+    return kb.get_keyboard()
+
+
+def admin_keyboard():
+    kb = VkKeyboard(one_time=False)
+    kb.add_button("/chats", color=VkKeyboardColor.PRIMARY)
+    kb.add_button("/close", color=VkKeyboardColor.NEGATIVE)
+    return kb.get_keyboard()
+
+
+def admin_empty_keyboard():
+    kb = VkKeyboard(one_time=False)
+    kb.add_button("/chats", color=VkKeyboardColor.PRIMARY)
     return kb.get_keyboard()
 
 
@@ -61,14 +75,146 @@ def send(vk, user_id, message, keyboard=None):
     vk.messages.send(**params)
 
 
-# ── Обработка сообщений ──────────────────────────────────────
+# ── Админ-команды ─────────────────────────────────────────────
+
+def handle_admin(vk, text):
+    """Обработка сообщений от админа. Возвращает True если обработано."""
+    global admin_chat_with
+    lower = text.strip().lower()
+
+    # /chats — список активных чатов
+    if lower == "/chats":
+        if not user_sessions:
+            send(vk, ADMIN_ID,
+                 "📭 Нет активных чатов.",
+                 admin_empty_keyboard())
+            return True
+        lines = ["📋 Активные чаты:\n"]
+        for uid in user_sessions:
+            marker = " ← текущий" if uid == admin_chat_with else ""
+            lines.append(f"• [id{uid}|#{uid}]{marker}")
+        lines.append(f"\nВсего: {len(user_sessions)}")
+        lines.append("\n/chat ID — подключиться к чату")
+        lines.append("/close — завершить текущий чат")
+        send(vk, ADMIN_ID, "\n".join(lines), admin_keyboard())
+        return True
+
+    # /chat ID — подключиться к конкретному пользователю
+    if lower.startswith("/chat "):
+        parts = text.strip().split(" ", 1)
+        try:
+            target_id = int(parts[1])
+        except (ValueError, IndexError):
+            send(vk, ADMIN_ID, "⚠ Формат: /chat ID_пользователя")
+            return True
+        if target_id not in user_sessions:
+            send(vk, ADMIN_ID,
+                 f"⚠ Пользователь #{target_id} не в режиме оператора.\n"
+                 f"Активные чаты: /chats")
+            return True
+        admin_chat_with = target_id
+        send(vk, ADMIN_ID,
+             f"💬 Вы подключились к чату с [id{target_id}|#{target_id}].\n\n"
+             f"Теперь просто пишите сообщения — они уйдут пользователю.\n"
+             f"/close — завершить чат",
+             admin_keyboard())
+        return True
+
+    # /close — завершить текущий чат или /close ID
+    if lower.startswith("/close"):
+        parts = text.strip().split(" ", 1)
+        if len(parts) == 2:
+            try:
+                target_id = int(parts[1])
+            except ValueError:
+                send(vk, ADMIN_ID, "⚠ Формат: /close или /close ID")
+                return True
+        elif admin_chat_with:
+            target_id = admin_chat_with
+        else:
+            send(vk, ADMIN_ID,
+                 "⚠ Нет активного чата. Укажите ID: /close 123456",
+                 admin_empty_keyboard())
+            return True
+
+        if target_id in user_sessions:
+            user_sessions.pop(target_id)
+            send(vk, target_id,
+                 "✅ Чат с оператором завершён.\n\n"
+                 "Спасибо за обращение! Если возникнут вопросы — "
+                 "мы всегда на связи.",
+                 main_keyboard())
+        if admin_chat_with == target_id:
+            admin_chat_with = None
+        send(vk, ADMIN_ID,
+             f"✅ Чат с #{target_id} завершён.",
+             admin_empty_keyboard())
+        return True
+
+    # #ID текст — быстрый ответ конкретному пользователю
+    if text.startswith("#"):
+        parts = text.split(" ", 1)
+        if len(parts) == 2:
+            try:
+                target_id = int(parts[0][1:])
+                reply_text = parts[1]
+                send(vk, target_id,
+                     f"💬 Оператор:\n\n{reply_text}",
+                     user_operator_keyboard())
+                send(vk, ADMIN_ID, f"✅ → #{target_id}")
+                return True
+            except ValueError:
+                pass
+
+    # Если админ подключён к чату — отправить сообщение напрямую
+    if admin_chat_with:
+        if admin_chat_with in user_sessions:
+            send(vk, admin_chat_with,
+                 f"💬 Оператор:\n\n{text}",
+                 user_operator_keyboard())
+            send(vk, ADMIN_ID, f"✅ → #{admin_chat_with}")
+            return True
+        else:
+            admin_chat_with = None
+            send(vk, ADMIN_ID,
+                 "⚠ Пользователь уже покинул чат.",
+                 admin_empty_keyboard())
+            return True
+
+    return False
+
+
+# ── Обработка сообщений пользователей ────────────────────────
 
 def handle_message(vk, user_id, text):
+    global admin_chat_with
     lower = text.lower().strip()
 
-    # --- Выход из режима оператора ---
+    # --- Завершить чат с оператором (пользователь) ---
+    if lower in ("❌ завершить чат", "завершить чат"):
+        if user_id in user_sessions:
+            user_sessions.pop(user_id)
+            if admin_chat_with == user_id:
+                admin_chat_with = None
+            send(vk, ADMIN_ID,
+                 f"🔴 Пользователь [id{user_id}|#{user_id}] завершил чат.",
+                 admin_empty_keyboard())
+        send(vk, user_id,
+             "✅ Чат с оператором завершён.\n\n"
+             "Спасибо за обращение! Если возникнут вопросы — "
+             "мы всегда на связи.",
+             main_keyboard())
+        return
+
+    # --- Выход в меню ---
     if lower in ("⬅ назад в меню", "назад в меню", "/menu", "/start"):
-        operator_sessions.pop(user_id, None)
+        if user_id in user_sessions:
+            user_sessions.pop(user_id)
+            if admin_chat_with == user_id:
+                admin_chat_with = None
+            send(vk, ADMIN_ID,
+                 f"🔴 Пользователь [id{user_id}|#{user_id}] покинул чат.",
+                 admin_empty_keyboard())
         send(vk, user_id,
              "🏠 Главное меню Atlas Secure | Поддержка\n\n"
              "Выберите действие:",
@@ -76,21 +222,23 @@ def handle_message(vk, user_id, text):
         return
 
     # --- Режим оператора: пересылка сообщений ---
-    if user_id in operator_sessions:
+    if user_id in user_sessions:
         if ADMIN_ID == 0:
             send(vk, user_id,
                  "⚠ Оператор временно недоступен. Попробуйте позже.",
-                 back_keyboard())
+                 user_operator_keyboard())
             return
-        # Пересылаем сообщение админу
         send(vk, ADMIN_ID,
-             f"📩 Сообщение от пользователя [id{user_id}|#{user_id}]:\n\n"
-             f"{text}\n\n"
-             f"💡 Чтобы ответить, напишите:\n#{user_id} ваш ответ")
+             f"📩 [id{user_id}|#{user_id}]:\n{text}",
+             admin_keyboard())
+        # Если админ ещё не подключён к этому чату — подсказка
+        if admin_chat_with != user_id:
+            send(vk, ADMIN_ID,
+                 f"💡 /chat {user_id} — подключиться и отвечать напрямую",
+                 admin_keyboard())
         send(vk, user_id,
-             "✅ Сообщение отправлено оператору. Ожидайте ответа.\n\n"
-             "Продолжайте писать — все сообщения будут переданы.",
-             back_keyboard())
+             "✅ Сообщение передано оператору.",
+             user_operator_keyboard())
         return
 
     # --- Приветствие ---
@@ -121,13 +269,18 @@ def handle_message(vk, user_id, text):
 
     # --- Связь с оператором ---
     if lower in ("👨‍💻 оператор", "оператор", "operator", "помощь", "help"):
-        operator_sessions[user_id] = True
+        user_sessions[user_id] = True
         send(vk, user_id,
              "👨‍💻 Вы подключены к оператору.\n\n"
              "Напишите ваш вопрос — мы передадим его нашему специалисту.\n"
              "Среднее время ответа — до 30 минут.\n\n"
-             "Для возврата в меню нажмите «⬅ Назад в меню».",
-             back_keyboard())
+             "Нажмите «❌ Завершить чат» когда вопрос будет решён.",
+             user_operator_keyboard())
+        send(vk, ADMIN_ID,
+             f"🟢 Новый чат! Пользователь [id{user_id}|#{user_id}] "
+             f"ожидает ответа.\n\n"
+             f"/chat {user_id} — подключиться к диалогу",
+             admin_keyboard())
         return
 
     # --- Назад ---
@@ -146,27 +299,6 @@ def handle_message(vk, user_id, text):
          main_keyboard())
 
 
-# ── Ответы админа пользователям ──────────────────────────────
-
-def handle_admin_reply(vk, text):
-    """Админ отвечает формата: #ID сообщение"""
-    if not text.startswith("#"):
-        return False
-    parts = text.split(" ", 1)
-    if len(parts) < 2:
-        return False
-    try:
-        target_id = int(parts[0][1:])
-    except ValueError:
-        return False
-    reply_text = parts[1]
-    send(vk, target_id,
-         f"💬 Ответ оператора:\n\n{reply_text}",
-         back_keyboard())
-    send(vk, ADMIN_ID, f"✅ Ответ доставлен пользователю #{target_id}.")
-    return True
-
-
 # ── Запуск бота ──────────────────────────────────────────────
 
 def main():
@@ -177,7 +309,6 @@ def main():
     vk_session = vk_api.VkApi(token=VK_TOKEN)
     vk = vk_session.get_api()
 
-    # Получаем ID группы
     group_info = vk.groups.getById()
     group_id = group_info[0]["id"]
     log.info("Бот запущен! Группа ID: %s", group_id)
@@ -201,9 +332,10 @@ def main():
 
             log.info("Сообщение от %s: %s", user_id, text)
 
-            # Если пишет админ — проверяем, не ответ ли это пользователю
-            if user_id == ADMIN_ID and handle_admin_reply(vk, text):
-                continue
+            # Сообщения от админа
+            if user_id == ADMIN_ID:
+                if handle_admin(vk, text):
+                    continue
 
             handle_message(vk, user_id, text)
 
