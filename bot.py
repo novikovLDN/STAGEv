@@ -1,5 +1,7 @@
 import os
+import time
 import logging
+import requests
 from dotenv import load_dotenv
 import vk_api
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
@@ -343,25 +345,35 @@ def main():
             "Укажите ваш VK ID в .env файле."
         )
 
-    longpoll = VkBotLongPoll(vk_session, group_id)
+    longpoll = VkBotLongPoll(vk_session, group_id, wait=25)
 
-    for event in longpoll.listen():
-        if event.type == VkBotEventType.MESSAGE_NEW:
-            msg = event.obj.message
-            user_id = msg["from_id"]
-            text = msg.get("text", "")
+    while True:
+        try:
+            for event in longpoll.listen():
+                if event.type == VkBotEventType.MESSAGE_NEW:
+                    msg = event.obj.message
+                    user_id = msg["from_id"]
+                    text = msg.get("text", "")
 
-            if not text:
-                continue
+                    if not text:
+                        continue
 
-            log.info("Сообщение от %s: %s", user_id, text)
+                    log.info("Сообщение от %s: %s", user_id, text)
 
-            # Сообщения от админа
-            if user_id == ADMIN_ID:
-                if handle_admin(vk, text):
-                    continue
+                    # Сообщения от админа
+                    if user_id == ADMIN_ID:
+                        if handle_admin(vk, text):
+                            continue
 
-            handle_message(vk, user_id, text)
+                    handle_message(vk, user_id, text)
+        except (requests.exceptions.ReadTimeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError) as e:
+            log.warning("Сетевая ошибка long poll: %s. Переподключение...", e)
+            time.sleep(3)
+        except Exception as e:
+            log.exception("Неожиданная ошибка в long poll: %s", e)
+            time.sleep(5)
 
 
 if __name__ == "__main__":
